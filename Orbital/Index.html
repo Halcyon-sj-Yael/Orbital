@@ -1,0 +1,1243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Hand-Controlled Music Visualizer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
+    <script>
+        // Suppress source map errors and warnings (they don't affect functionality)
+        (function() {
+            // Suppress console warnings about source maps
+            if (window.console && console.warn) {
+                const originalWarn = console.warn;
+                console.warn = function(...args) {
+                    if (args[0] && typeof args[0] === 'string' && 
+                        (args[0].includes('source map') || args[0].includes('.map'))) {
+                        return; // Suppress source map warnings
+                    }
+                    originalWarn.apply(console, args);
+                };
+            }
+            
+            // Suppress console errors about source maps
+            if (window.console && console.error) {
+                const originalError = console.error;
+                console.error = function(...args) {
+                    if (args[0] && typeof args[0] === 'string' && 
+                        (args[0].includes('source map') || args[0].includes('.map') || 
+                         args[0].includes('404') && args[0].includes('.map'))) {
+                        return; // Suppress source map 404 errors
+                    }
+                    originalError.apply(console, args);
+                };
+            }
+            
+            // Suppress network errors for .map files
+            window.addEventListener('error', function(e) {
+                if (e.filename && e.filename.includes('.map')) {
+                    e.preventDefault();
+                    return false;
+                }
+            }, true);
+        })();
+    </script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #000;
+            font-family: Arial, sans-serif;
+        }
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 100;
+            color: white;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 10px;
+            font-size: 14px;
+            max-width: 300px;
+        }
+        #videoContainer {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            z-index: 50;
+            width: 200px;
+            height: 150px;
+            border: 2px solid #ff6b9d;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #000;
+            display: none;
+        }
+        #videoElement {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+        #fileInput {
+            margin-top: 10px;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-top: 10px;
+            margin-right: 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <h3>✋ Hand-Controlled Visualizer</h3>
+        <button id="micBtn">🎤 Start Audio</button>
+        <button id="handBtn">✋ Start Hand Tracking</button>
+        <button id="stopBtn" disabled style="background: #f44336;">⏹ Stop</button>
+        <p id="status" style="margin-top: 10px; font-size: 12px; color: #ffeb3b;">
+            Start audio and hand tracking
+        </p>
+        <p style="margin-top: 10px; font-size: 12px;">
+            <strong>How to create shapes:</strong><br>
+            ❤️ <strong>Heart:</strong> Make a fist<br>
+            ⭐ <strong>Star:</strong> Spread all 5 fingers<br>
+            💎 <strong>Diamond:</strong> Point index finger up<br>
+            🌙 <strong>Crescent:</strong> Make peace sign (✌️)<br>
+            <br>
+            🖱️ Move mouse to rotate camera<br>
+            🎤 Shapes react to audio<br>
+            👥 Supports multiple hands!
+        </p>
+        <p id="gestureStatus" style="margin-top: 10px; font-size: 11px; color: #4CAF50; min-height: 20px;">
+            Show your hand to see detected gesture
+        </p>
+    </div>
+    <div id="videoContainer">
+        <video id="videoElement" autoplay playsinline></video>
+    </div>
+
+    <script>
+        let audioContext;
+        let microphone;
+        let source;
+        let analyser;
+        let dataArray;
+        let bufferLength;
+        let isMicActive = false;
+
+        // Visual elements
+        let particles = [];
+        let reactiveObjects = [];
+        let stars = [];
+        let cameraRotation = { x: 0, y: 0 };
+        let cameraDistance = 500;
+
+        // Audio data
+        let bass = 0;
+        let treble = 0;
+        let vocals = 0;
+        let overallVolume = 0;
+
+        // Color variables
+        let baseHue = 0;
+        let colorShift = 0;
+
+        // Mouse interaction
+        let mouseXPos = 0;
+        let mouseYPos = 0;
+        let isMousePressed = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        // Hand tracking - multiple hands support
+        let handposeModel;
+        let video;
+        let videoElement;
+        let handShapes = [];
+        let trackedHands = [];
+        let isHandTrackingActive = false;
+
+        function setup() {
+            createCanvas(windowWidth, windowHeight, WEBGL);
+            colorMode(HSB, 360, 100, 100);
+            
+            // Initialize 3D stars
+            for (let i = 0; i < 200; i++) {
+                stars.push({
+                    x: random(-width, width),
+                    y: random(-height, height),
+                    z: random(-1000, 1000),
+                    size: random(1, 4),
+                    brightness: random(50, 100),
+                    speed: random(0.5, 2)
+                });
+            }
+
+            // Setup microphone
+            const micBtn = document.getElementById('micBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            const status = document.getElementById('status');
+
+            micBtn.addEventListener('click', async function() {
+                try {
+                    // Request microphone access
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        audio: {
+                            echoCancellation: false,
+                            noiseSuppression: false,
+                            autoGainControl: false
+                        } 
+                    });
+                    
+                    // Initialize audio context
+                    if (!audioContext) {
+                        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    
+                    if (audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    
+                    // Create microphone source
+                    source = audioContext.createMediaStreamSource(stream);
+                    analyser = audioContext.createAnalyser();
+                    analyser.fftSize = 512;
+                    analyser.smoothingTimeConstant = 0.3;
+                    bufferLength = analyser.frequencyBinCount;
+                    dataArray = new Uint8Array(bufferLength);
+                    
+                    source.connect(analyser);
+                    // Don't connect to destination to avoid feedback
+                    
+                    microphone = stream;
+                    isMicActive = true;
+                    
+                    micBtn.disabled = true;
+                    stopBtn.disabled = false;
+                    status.textContent = '🎤 Microphone active - Listening...';
+                    status.style.color = '#4CAF50';
+                    
+                } catch (error) {
+                    console.error('Microphone error:', error);
+                    status.textContent = '❌ Microphone access denied. Please allow microphone access.';
+                    status.style.color = '#f44336';
+                    alert('Please allow microphone access to use the visualizer.');
+                }
+            });
+
+            stopBtn.addEventListener('click', function() {
+                if (microphone) {
+                    microphone.getTracks().forEach(track => track.stop());
+                    microphone = null;
+                    isMicActive = false;
+                }
+                if (video) {
+                    video.stop();
+                    video = null;
+                }
+                if (videoElement && videoElement.srcObject) {
+                    videoElement.srcObject.getTracks().forEach(track => track.stop());
+                    videoElement.srcObject = null;
+                    document.getElementById('videoContainer').style.display = 'none';
+                }
+                isHandTrackingActive = false;
+                if (handposeModel) {
+                    handposeModel = null;
+                }
+                trackedHands = [];
+                handShapes = [];
+                
+                micBtn.disabled = false;
+                document.getElementById('handBtn').disabled = false;
+                stopBtn.disabled = true;
+                status.textContent = 'Stopped';
+                status.style.color = '#ffeb3b';
+            });
+
+            // Setup hand tracking
+            const handBtn = document.getElementById('handBtn');
+            handBtn.addEventListener('click', async function() {
+                try {
+                    status.textContent = '📷 Requesting camera access...';
+                    status.style.color = '#ffeb3b';
+                    
+                    videoElement = document.getElementById('videoElement');
+                    const videoContainer = document.getElementById('videoContainer');
+                    
+                    // First, get the media stream directly
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
+                        video: { 
+                            width: 640, 
+                            height: 480,
+                            facingMode: 'user'
+                        } 
+                    });
+                    
+                    // Set the stream to the video element
+                    videoElement.srcObject = stream;
+                    videoContainer.style.display = 'block';
+                    
+                    // Wait for video to be ready
+                    videoElement.onloadedmetadata = async function() {
+                        try {
+                            // Wait for video to actually start playing
+                            await videoElement.play();
+                            
+                            status.textContent = '🤖 Loading hand tracking model...';
+                            status.style.color = '#ffeb3b';
+                            
+                            // Check if TensorFlow.js is loaded
+                            if (typeof tf === 'undefined') {
+                                status.textContent = '❌ TensorFlow.js not loaded. Please refresh the page.';
+                                status.style.color = '#f44336';
+                                return;
+                            }
+                            
+                            // Load handpose using multiple fallback methods
+                            let handposeLoader;
+                            let loadError = null;
+                            
+                            // Method 1: Try ES module imports from various CDNs
+                            const importAttempts = [
+                                'https://cdn.skypack.dev/@tensorflow-models/handpose',
+                                'https://esm.sh/@tensorflow-models/handpose',
+                                'https://cdn.skypack.dev/@tensorflow-models/handpose@0.0.6'
+                            ];
+                            
+                            let handposeModule = null;
+                            for (let url of importAttempts) {
+                                try {
+                                    handposeModule = await import(url);
+                                    console.log('Successfully loaded handpose from:', url);
+                                    handposeLoader = handposeModule.default || handposeModule;
+                                    break;
+                                } catch (err) {
+                                    loadError = err;
+                                    console.warn('Failed to load from', url);
+                                    continue;
+                                }
+                            }
+                            
+                            // Method 2: If ES modules failed, try loading via script tag with UMD bundle
+                            if (!handposeLoader) {
+                                status.textContent = '📦 Loading handpose model (alternative method)...';
+                                status.style.color = '#ffeb3b';
+                                
+                                await new Promise((resolve, reject) => {
+                                    // Check if already in window
+                                    if (window.handpose) {
+                                        handposeLoader = window.handpose;
+                                        resolve();
+                                        return;
+                                    }
+                                    
+                                    const script = document.createElement('script');
+                                    script.src = 'https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.6/dist/handpose.min.js';
+                                    script.async = true;
+                                    script.onload = () => {
+                                        // Wait for handpose to be available
+                                        setTimeout(() => {
+                                            if (window.handpose) {
+                                                handposeLoader = window.handpose;
+                                                resolve();
+                                            } else {
+                                                reject(new Error('Handpose loaded but not available in window'));
+                                            }
+                                        }, 500);
+                                    };
+                                    script.onerror = () => {
+                                        reject(new Error('Failed to load handpose via script tag'));
+                                    };
+                                    document.head.appendChild(script);
+                                });
+                            }
+                            
+                            if (!handposeLoader) {
+                                throw new Error('Failed to load handpose model from all methods. Please check your internet connection and try refreshing the page.');
+                            }
+                            
+                            // Load the handpose model - supports multiple hands by default
+                            try {
+                                handposeModel = await handposeLoader.load();
+                                
+                                handBtn.disabled = true;
+                                isHandTrackingActive = true;
+                                status.textContent = '✋ Hand tracking active! Show 1-2 hands to the camera';
+                                status.style.color = '#4CAF50';
+                                
+                            // Start prediction loop
+                            predictHands();
+                            
+                            } catch (loadError) {
+                                console.error('Model load error:', loadError);
+                                status.textContent = '❌ Failed to load hand tracking model: ' + loadError.message;
+                                status.style.color = '#f44336';
+                            }
+                            
+                        } catch (error) {
+                            console.error('Hand tracking initialization error:', error);
+                            status.textContent = '❌ Hand tracking failed: ' + error.message;
+                            status.style.color = '#f44336';
+                        }
+                    };
+                    
+                    // Function to continuously predict hands - smoother and supports multiple hands
+                    async function predictHands() {
+                        if (!isHandTrackingActive || !handposeModel || !videoElement) return;
+                        
+                        try {
+                            const predictions = await handposeModel.estimateHands(videoElement);
+                            
+                            if (predictions && predictions.length > 0) {
+                                // Update all detected hands
+                                updateMultipleHands(predictions);
+                                
+                                // Update status to show gestures detected
+                                let gestureStatus = document.getElementById('gestureStatus');
+                                let gestureText = '';
+                                
+                                for (let i = 0; i < trackedHands.length; i++) {
+                                    let hand = trackedHands[i];
+                                    if (hand.life > 0 && hand.currentGesture) {
+                                        let gestureName = hand.currentGesture.charAt(0).toUpperCase() + hand.currentGesture.slice(1);
+                                        let emoji = '';
+                                        if (hand.currentGesture === 'heart') emoji = '❤️';
+                                        else if (hand.currentGesture === 'star') emoji = '⭐';
+                                        else if (hand.currentGesture === 'diamond') emoji = '💎';
+                                        else if (hand.currentGesture === 'crescent') emoji = '🌙';
+                                        
+                                        if (gestureText) gestureText += ' | ';
+                                        gestureText += `Hand ${i+1}: ${emoji} ${gestureName}`;
+                                    }
+                                }
+                                
+                                if (gestureText) {
+                                    gestureStatus.textContent = gestureText;
+                                    gestureStatus.style.color = '#4CAF50';
+                                } else {
+                                    gestureStatus.textContent = 'Show your hand to see detected gesture';
+                                    gestureStatus.style.color = '#ffeb3b';
+                                }
+                                
+                                // Update main status
+                                if (predictions.length === 1) {
+                                    status.textContent = '✋ 1 hand detected - Show another hand!';
+                                } else {
+                                    status.textContent = '✋ ' + predictions.length + ' hands detected!';
+                                }
+                            } else {
+                                // No hands detected - gradually fade out tracked hands
+                                trackedHands = trackedHands.filter(hand => {
+                                    hand.life--;
+                                    return hand.life > 0;
+                                });
+                                
+                                if (trackedHands.length === 0) {
+                                    status.textContent = '✋ No hands detected - Show your hands to the camera';
+                                    document.getElementById('gestureStatus').textContent = 'Show your hand to see detected gesture';
+                                    document.getElementById('gestureStatus').style.color = '#ffeb3b';
+                                }
+                            }
+                        } catch (error) {
+                            console.error('Prediction error:', error);
+                        }
+                        
+                        // Continue prediction loop - faster for smoother tracking
+                        if (isHandTrackingActive) {
+                            setTimeout(predictHands, 16); // ~60fps for smoother tracking
+                        }
+                    }
+                    
+                    // Handle video errors
+                    videoElement.onerror = function(error) {
+                        console.error('Video error:', error);
+                        status.textContent = '❌ Video stream error';
+                        status.style.color = '#f44336';
+                    };
+                    
+                } catch (error) {
+                    console.error('Hand tracking error:', error);
+                    if (error.name === 'NotAllowedError') {
+                        status.textContent = '❌ Camera access denied. Please allow camera access.';
+                    } else if (error.name === 'NotFoundError') {
+                        status.textContent = '❌ No camera found. Please connect a camera.';
+                    } else if (error.name === 'NotReadableError') {
+                        status.textContent = '❌ Camera is being used by another app.';
+                    } else {
+                        status.textContent = '❌ Camera error: ' + error.message;
+                    }
+                    status.style.color = '#f44336';
+                }
+            });
+        }
+
+        function updateMultipleHands(predictions) {
+            // Mark all existing hands as not updated
+            trackedHands.forEach(hand => hand.updated = false);
+            
+            // Process each detected hand
+            for (let i = 0; i < predictions.length; i++) {
+                let prediction = predictions[i];
+                if (!prediction || !prediction.landmarks || prediction.landmarks.length === 0) continue;
+                
+                // Get wrist position (landmark 0)
+                let wrist = prediction.landmarks[0];
+                
+                // Convert pixel coordinates to normalized, then to 3D space
+                let normalizedX = (wrist[0] / 640) - 0.5;
+                let normalizedY = (wrist[1] / 480) - 0.5;
+                let normalizedZ = (wrist[2] || 0) / 100;
+                
+                let handX = normalizedX * width * 2;
+                let handY = normalizedY * height * 2;
+                let handZ = normalizedZ * 500;
+                
+                // Find closest existing hand tracker (by position) or create new one
+                let handTracker = findClosestHand(handX, handY, handZ);
+                
+                if (!handTracker) {
+                    // Create new hand tracker
+                    let newId = trackedHands.length;
+                    handTracker = {
+                        id: newId,
+                        x: handX,
+                        y: handY,
+                        z: handZ,
+                        targetX: handX,
+                        targetY: handY,
+                        targetZ: handZ,
+                        velocityX: 0,
+                        velocityY: 0,
+                        velocityZ: 0,
+                        life: 30,
+                        shapeCounter: 0,
+                        updated: true
+                    };
+                    trackedHands.push(handTracker);
+                } else {
+                    // Update existing hand tracker
+                    handTracker.targetX = handX;
+                    handTracker.targetY = handY;
+                    handTracker.targetZ = handZ;
+                    handTracker.life = 30;
+                    handTracker.updated = true;
+                }
+                
+                // Smooth movement with velocity-based interpolation
+                let smoothFactor = 0.15;
+                
+                // Calculate velocity for smoother motion
+                handTracker.velocityX = lerp(handTracker.velocityX, (handTracker.targetX - handTracker.x) * 0.1, 0.3);
+                handTracker.velocityY = lerp(handTracker.velocityY, (handTracker.targetY - handTracker.y) * 0.1, 0.3);
+                handTracker.velocityZ = lerp(handTracker.velocityZ, (handTracker.targetZ - handTracker.z) * 0.1, 0.3);
+                
+                // Apply smooth interpolation with velocity
+                handTracker.x = lerp(handTracker.x, handTracker.targetX, smoothFactor) + handTracker.velocityX;
+                handTracker.y = lerp(handTracker.y, handTracker.targetY, smoothFactor) + handTracker.velocityY;
+                handTracker.z = lerp(handTracker.z, handTracker.targetZ, smoothFactor) + handTracker.velocityZ;
+                
+                // Detect gesture and create shape based on gesture
+                let gesture = detectHandGesture(prediction.landmarks);
+                handTracker.currentGesture = gesture;
+                
+                // Create shapes based on gesture
+                if (frameCount % 6 === 0) {
+                    createHandShape(handTracker, gesture);
+                }
+            }
+            
+            // Remove hands that are no longer detected (not updated)
+            trackedHands = trackedHands.filter(hand => {
+                if (!hand.updated) {
+                    hand.life--;
+                    return hand.life > 0;
+                }
+                return true;
+            });
+        }
+
+        function findClosestHand(x, y, z) {
+            let closestHand = null;
+            let minDistance = Infinity;
+            let maxMatchDistance = 300; // Increased distance to better match hands
+            
+            for (let hand of trackedHands) {
+                if (hand.updated) continue; // Skip already matched hands
+                
+                let distance = dist(x, y, z, hand.x, hand.y, hand.z);
+                if (distance < minDistance && distance < maxMatchDistance) {
+                    minDistance = distance;
+                    closestHand = hand;
+                }
+            }
+            
+            return closestHand;
+        }
+
+        function detectHandGesture(landmarks) {
+            if (!landmarks || landmarks.length < 21) return 'unknown';
+            
+            // Hand landmarks: 0=wrist, 1-4=thumb, 5-8=index, 9-12=middle, 13-16=ring, 17-20=pinky
+            // Check if fingers are extended (tip is above the PIP joint)
+            // For thumb, check if it's extended outward (x position)
+            let thumbExtended = landmarks[4][0] > landmarks[3][0]; // Thumb extended outward
+            let indexExtended = landmarks[8][1] < landmarks[6][1]; // Index tip above PIP
+            let middleExtended = landmarks[12][1] < landmarks[10][1]; // Middle tip above PIP
+            let ringExtended = landmarks[16][1] < landmarks[14][1]; // Ring tip above PIP
+            let pinkyExtended = landmarks[20][1] < landmarks[18][1]; // Pinky tip above PIP
+            
+            let extendedCount = [indexExtended, middleExtended, ringExtended, pinkyExtended].filter(x => x).length;
+            
+            // Gesture detection with better logic
+            // Fist (Heart): No fingers extended
+            if (!indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+                return 'heart';
+            }
+            // All fingers extended (Star): 4 fingers up (thumb optional)
+            else if (extendedCount === 4) {
+                return 'star';
+            }
+            // Only index finger (Diamond): Just index extended
+            else if (indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+                return 'diamond';
+            }
+            // Peace sign (Crescent): Index and middle extended, others closed
+            else if (indexExtended && middleExtended && !ringExtended && !pinkyExtended) {
+                return 'crescent';
+            }
+            
+            return 'unknown';
+        }
+
+        function createHandShape(handTracker, gesture) {
+            // Map gesture to shape type
+            let shapeType = 'star'; // Default
+            if (gesture === 'heart') {
+                shapeType = 'heart';
+            } else if (gesture === 'star') {
+                shapeType = 'star';
+            } else if (gesture === 'diamond') {
+                shapeType = 'diamond';
+            } else if (gesture === 'crescent') {
+                shapeType = 'crescent';
+            }
+            
+            // If gesture is unknown, cycle through shapes
+            if (gesture === 'unknown') {
+                let shapeTypes = ['heart', 'star', 'diamond', 'crescent'];
+                shapeType = shapeTypes[handTracker.shapeCounter % 4];
+                handTracker.shapeCounter++;
+            }
+            
+            handShapes.push({
+                x: handTracker.x,
+                y: handTracker.y,
+                z: handTracker.z,
+                type: shapeType,
+                baseSize: random(25, 45),
+                hueOffset: random(0, 360),
+                handId: handTracker.id, // Track which hand created this shape
+                rotation: { 
+                    x: random(0, TWO_PI), 
+                    y: random(0, TWO_PI), 
+                    z: random(0, TWO_PI) 
+                },
+                life: 300,
+                rotationSpeed: { 
+                    x: random(-0.003, 0.003), 
+                    y: random(-0.003, 0.003), 
+                    z: random(-0.003, 0.003) 
+                }
+            });
+            
+            // Limit number of shapes per hand
+            let shapesForThisHand = handShapes.filter(s => s.handId === handTracker.id);
+            if (shapesForThisHand.length > 20) {
+                // Remove oldest shape from this hand
+                let oldestIndex = handShapes.findIndex(s => s.handId === handTracker.id);
+                if (oldestIndex !== -1) {
+                    handShapes.splice(oldestIndex, 1);
+                }
+            }
+            
+            // Overall limit
+            if (handShapes.length > 80) {
+                handShapes.shift();
+            }
+        }
+
+        function drawShape(shape) {
+            let size = shape.baseSize * (1 + bass * 1.5);
+            let hue = (baseHue + shape.hueOffset + colorShift) % 360;
+            
+            fill(hue, 80, 100, 0.9);
+            stroke(hue, 100, 50);
+            strokeWeight(2);
+            
+            // Update rotation - very slow spinning
+            shape.rotation.x += shape.rotationSpeed.x + vocals * 0.001;
+            shape.rotation.y += shape.rotationSpeed.y + bass * 0.001;
+            shape.rotation.z += shape.rotationSpeed.z + treble * 0.001;
+            
+            rotateX(shape.rotation.x);
+            rotateY(shape.rotation.y);
+            rotateZ(shape.rotation.z);
+            
+            switch(shape.type) {
+                case 'heart':
+                    drawHeart(size);
+                    break;
+                case 'star':
+                    drawStar(size);
+                    break;
+                case 'diamond':
+                    drawDiamond(size);
+                    break;
+                case 'crescent':
+                    drawCrescent(size);
+                    break;
+            }
+        }
+
+        function drawHeart(size) {
+            // Create heart shape using multiple spheres
+            push();
+            // Top left curve
+            translate(-size * 0.3, -size * 0.5, 0);
+            sphere(size * 0.4);
+            pop();
+            
+            push();
+            // Top right curve
+            translate(size * 0.3, -size * 0.5, 0);
+            sphere(size * 0.4);
+            pop();
+            
+            push();
+            // Bottom point
+            translate(0, size * 0.3, 0);
+            rotateZ(PI / 4);
+            scale(1, 1.5, 1);
+            sphere(size * 0.5);
+            pop();
+        }
+
+        function drawStar(size) {
+            let points = 5;
+            let outerRadius = size;
+            let innerRadius = size * 0.4;
+            
+            // Draw star using triangles
+            for (let i = 0; i < points; i++) {
+                let angle1 = (i * TWO_PI) / points - HALF_PI;
+                let angle2 = ((i + 1) * TWO_PI) / points - HALF_PI;
+                let angle3 = (i * TWO_PI) / points + (TWO_PI / (points * 2)) - HALF_PI;
+                
+                beginShape(TRIANGLES);
+                vertex(0, 0, 0);
+                vertex(outerRadius * cos(angle1), outerRadius * sin(angle1), 0);
+                vertex(innerRadius * cos(angle3), innerRadius * sin(angle3), 0);
+                vertex(0, 0, 0);
+                vertex(innerRadius * cos(angle3), innerRadius * sin(angle3), 0);
+                vertex(outerRadius * cos(angle2), outerRadius * sin(angle2), 0);
+                endShape();
+            }
+            
+            // Add depth with second layer
+            push();
+            translate(0, 0, -size * 0.2);
+            for (let i = 0; i < points; i++) {
+                let angle1 = (i * TWO_PI) / points - HALF_PI;
+                let angle2 = ((i + 1) * TWO_PI) / points - HALF_PI;
+                let angle3 = (i * TWO_PI) / points + (TWO_PI / (points * 2)) - HALF_PI;
+                
+                beginShape(TRIANGLES);
+                vertex(0, 0, 0);
+                vertex(outerRadius * cos(angle1), outerRadius * sin(angle1), 0);
+                vertex(innerRadius * cos(angle3), innerRadius * sin(angle3), 0);
+                vertex(0, 0, 0);
+                vertex(innerRadius * cos(angle3), innerRadius * sin(angle3), 0);
+                vertex(outerRadius * cos(angle2), outerRadius * sin(angle2), 0);
+                endShape();
+            }
+            pop();
+        }
+
+        function drawDiamond(size) {
+            // Draw diamond as octahedron
+            beginShape();
+            // Top point
+            vertex(0, -size, 0);
+            // Front points
+            vertex(size * 0.7, 0, size * 0.7);
+            vertex(0, size, 0);
+            vertex(-size * 0.7, 0, size * 0.7);
+            endShape(CLOSE);
+            
+            beginShape();
+            // Top point
+            vertex(0, -size, 0);
+            // Back points
+            vertex(size * 0.7, 0, -size * 0.7);
+            vertex(0, size, 0);
+            vertex(-size * 0.7, 0, -size * 0.7);
+            endShape(CLOSE);
+            
+            beginShape();
+            // Top point
+            vertex(0, -size, 0);
+            // Right points
+            vertex(size * 0.7, 0, size * 0.7);
+            vertex(0, size, 0);
+            vertex(size * 0.7, 0, -size * 0.7);
+            endShape(CLOSE);
+            
+            beginShape();
+            // Top point
+            vertex(0, -size, 0);
+            // Left points
+            vertex(-size * 0.7, 0, size * 0.7);
+            vertex(0, size, 0);
+            vertex(-size * 0.7, 0, -size * 0.7);
+            endShape(CLOSE);
+        }
+
+        function drawCrescent(size) {
+            // Draw crescent shape using vertices
+            beginShape();
+            for (let angle = -PI * 0.7; angle < PI * 0.7; angle += 0.2) {
+                let r = size * (1 + 0.2 * abs(sin(angle)));
+                let x = r * cos(angle);
+                let y = r * sin(angle) * 0.6;
+                let z = sin(angle * 2) * size * 0.2;
+                vertex(x, y, z);
+            }
+            // Inner curve
+            for (let angle = PI * 0.7; angle > -PI * 0.7; angle -= 0.2) {
+                let r = size * 0.5;
+                let x = r * cos(angle) + size * 0.4;
+                let y = r * sin(angle) * 0.6;
+                let z = sin(angle * 2) * size * 0.2;
+                vertex(x, y, z);
+            }
+            endShape(CLOSE);
+        }
+
+        function draw() {
+            background(0, 0, 5);
+            
+            // Update mouse position
+            mouseXPos = lerp(mouseXPos, mouseX, 0.1);
+            mouseYPos = lerp(mouseYPos, mouseY, 0.1);
+
+            // Camera rotation with mouse
+            if (isMousePressed) {
+                cameraRotation.y += (mouseX - lastMouseX) * 0.01;
+                cameraRotation.x += (mouseY - lastMouseY) * 0.01;
+                cameraRotation.x = constrain(cameraRotation.x, -PI/2, PI/2);
+            }
+            lastMouseX = mouseX;
+            lastMouseY = mouseY;
+
+            // Camera distance with mouse wheel
+            cameraDistance = lerp(cameraDistance, 400 + (mouseY / height) * 300, 0.1);
+
+            // Analyze audio
+            if (analyser && isMicActive) {
+                analyser.getByteFrequencyData(dataArray);
+                
+                // Calculate bass (low frequencies)
+                bass = 0;
+                for (let i = 0; i < 20; i++) {
+                    bass += dataArray[i];
+                }
+                bass = bass / 20 / 255;
+
+                // Calculate treble (high frequencies)
+                treble = 0;
+                let trebleCount = 0;
+                for (let i = 150; i < bufferLength; i++) {
+                    treble += dataArray[i];
+                    trebleCount++;
+                }
+                treble = trebleCount > 0 ? treble / trebleCount / 255 : 0;
+
+                // Calculate vocals (mid frequencies)
+                vocals = 0;
+                for (let i = 40; i < 120; i++) {
+                    vocals += dataArray[i];
+                }
+                vocals = vocals / 80 / 255;
+
+                // Overall volume
+                overallVolume = 0;
+                for (let i = 0; i < bufferLength; i++) {
+                    overallVolume += dataArray[i];
+                }
+                overallVolume = overallVolume / bufferLength / 255;
+
+                // Color shift with treble
+                colorShift = treble * 60;
+                baseHue = (baseHue + 1 + colorShift * 0.1) % 360;
+            } else {
+                // Default values when no audio
+                bass = 0.1;
+                treble = 0.1;
+                vocals = 0.1;
+                overallVolume = 0.1;
+                baseHue = (baseHue + 0.5) % 360;
+            }
+
+            // Set up 3D camera
+            rotateX(cameraRotation.x);
+            rotateY(cameraRotation.y);
+            translate(0, 0, -cameraDistance);
+
+            // Draw 3D stars that explode on beat
+            push();
+            noFill();
+            for (let star of stars) {
+                star.z += star.speed;
+                if (star.z > 500) star.z = -1000;
+                
+                if (overallVolume > 0.3) {
+                    star.brightness = min(100, star.brightness + overallVolume * 30);
+                    star.size = min(10, star.size + overallVolume * 1.5);
+                } else {
+                    star.brightness = max(50, star.brightness * 0.97);
+                    star.size = max(1, star.size * 0.99);
+                }
+                
+                push();
+                translate(star.x, star.y, star.z);
+                let starHue = (baseHue + star.z * 0.1) % 360;
+                fill(starHue, 20, star.brightness, 0.8);
+                noStroke();
+                sphere(star.size);
+                pop();
+            }
+            pop();
+
+            // Draw pulsing 3D sphere (heartbeat effect with bass)
+            push();
+            let pulseSize = 30 + bass * 150;
+            let pulseHue = (baseHue + colorShift) % 360;
+            fill(pulseHue, 80, 80, 0.4);
+            noStroke();
+            sphere(pulseSize);
+            
+            // Inner sphere
+            fill(pulseHue, 90, 90, 0.6);
+            sphere(pulseSize * 0.6);
+            pop();
+
+            // Draw 3D dancing lines (vocals) - frequency bars in 3D
+            push();
+            translate(-width/4, 0, 0);
+            for (let i = 0; i < 40; i++) {
+                let freqValue = analyser ? dataArray[Math.floor(i * bufferLength / 40)] / 255 : 0.1;
+                let barHeight = freqValue * 200 * (1 + vocals);
+                let barWidth = 8;
+                let xPos = (i * 15) - 300;
+                
+                let lineHue = (baseHue + i * 5 + colorShift) % 360;
+                fill(lineHue, 70, 90, 0.8);
+                noStroke();
+                
+                push();
+                translate(xPos, -barHeight/2, 0);
+                box(barWidth, barHeight, barWidth);
+                pop();
+            }
+            pop();
+
+            // Draw 3D galaxy particles
+            push();
+            for (let i = 0; i < particles.length; i++) {
+                let p = particles[i];
+                p.angle += p.speed * (1 + bass * 2);
+                p.radius += sin(p.angle) * 0.5;
+                p.z += p.zSpeed;
+                
+                let x = cos(p.angle) * p.radius;
+                let y = sin(p.angle) * p.radius;
+                
+                let particleHue = (baseHue + p.angle * 57.3 + colorShift) % 360;
+                fill(particleHue, 80, 90, 0.9);
+                noStroke();
+                
+                push();
+                translate(x, y, p.z);
+                let particleSize = p.size * (1 + bass * 3);
+                sphere(particleSize);
+                pop();
+            }
+            pop();
+
+            // Add new 3D particles based on mouse movement
+            if (frameCount % 3 === 0) {
+                let angle = atan2(mouseYPos, mouseXPos);
+                let radius = dist(mouseXPos, mouseYPos, 0, 0);
+                particles.push({
+                    angle: angle,
+                    radius: radius * 0.5,
+                    speed: map(mouseX, 0, width, 0.02, 0.08),
+                    size: random(3, 8),
+                    z: random(-200, 200),
+                    zSpeed: random(-1, 1)
+                });
+                
+                if (particles.length > 300) {
+                    particles.shift();
+                }
+            }
+
+            // Draw multiple dancing 3D cubes
+            push();
+            for (let i = 0; i < 5; i++) {
+                push();
+                let angle = (TWO_PI / 5) * i + frameCount * 0.005;
+                let radius = 100 + bass * 50;
+                translate(cos(angle) * radius, sin(angle) * radius, sin(frameCount * 0.025 + i) * 50);
+                
+                rotateX(vocals * TWO_PI * 0.15 + i);
+                rotateY(bass * TWO_PI * 0.1 + i * 0.5);
+                rotateZ(treble * TWO_PI * 0.08 + i * 0.3);
+                
+                let cubeSize = 20 + bass * 60;
+                let cubeHue = (baseHue + i * 72 + colorShift) % 360;
+                
+                fill(cubeHue, 100, 100, 0.7);
+                stroke(cubeHue, 100, 50);
+                strokeWeight(1);
+                box(cubeSize);
+                pop();
+            }
+            pop();
+
+            // Draw reactive 3D objects (added on click)
+            for (let obj of reactiveObjects) {
+                push();
+                translate(obj.x, obj.y, obj.z);
+                
+                rotateX(obj.rotation.x);
+                rotateY(obj.rotation.y);
+                rotateZ(obj.rotation.z);
+                
+                obj.rotation.x += vocals * 0.02;
+                obj.rotation.y += bass * 0.03;
+                obj.rotation.z += treble * 0.015;
+                
+                let objSize = obj.baseSize * (1 + bass * 2);
+                let objHue = (baseHue + obj.hueOffset + colorShift) % 360;
+                
+                fill(objHue, 70, 90, 0.8);
+                stroke(objHue, 100, 100);
+                strokeWeight(1);
+                
+                if (obj.type === 'sphere') {
+                    sphere(objSize);
+                } else if (obj.type === 'box') {
+                    box(objSize);
+                } else if (obj.type === 'torus') {
+                    torus(objSize * 0.6, objSize * 0.3);
+                } else if (obj.type === 'cone') {
+                    cone(objSize * 0.6, objSize);
+                }
+                
+                // Add 3D lines from object
+                for (let i = 0; i < 12; i++) {
+                    let angle = (TWO_PI / 12) * i + vocals * TWO_PI;
+                    let lineLength = objSize * 0.8 * (1 + treble);
+                    let x2 = cos(angle) * lineLength;
+                    let y2 = sin(angle) * lineLength;
+                    let z2 = sin(angle * 2) * lineLength * 0.5;
+                    
+                    stroke(objHue, 60, 80);
+                    strokeWeight(2);
+                    line(0, 0, 0, x2, y2, z2);
+                }
+                
+                pop();
+            }
+
+            // Remove old reactive objects
+            reactiveObjects = reactiveObjects.filter(obj => {
+                obj.life--;
+                return obj.life > 0;
+            });
+
+            // Draw hand-controlled shapes
+            for (let shape of handShapes) {
+                push();
+                translate(shape.x, shape.y, shape.z);
+                drawShape(shape);
+                
+                // Add energy particles around shapes
+                for (let i = 0; i < 6; i++) {
+                    let angle = (TWO_PI / 6) * i + frameCount * 0.025;
+                    let dist = shape.baseSize * 0.8 * (1 + overallVolume);
+                    let x = cos(angle) * dist;
+                    let y = sin(angle) * dist;
+                    let z = sin(angle * 2) * dist * 0.5;
+                    
+                    let particleHue = (baseHue + shape.hueOffset + i * 30) % 360;
+                    fill(particleHue, 70, 90, 0.6);
+                    noStroke();
+                    push();
+                    translate(x, y, z);
+                    sphere(3 + bass * 5);
+                    pop();
+                }
+                pop();
+            }
+            
+            // Remove old hand shapes
+            handShapes = handShapes.filter(shape => {
+                shape.life--;
+                return shape.life > 0;
+            });
+
+            // Draw hand position indicators for all tracked hands
+            for (let i = 0; i < trackedHands.length; i++) {
+                let hand = trackedHands[i];
+                if (hand.life > 0) {
+                    push();
+                    translate(hand.x, hand.y, hand.z);
+                    
+                    // Different color for each hand
+                    let indicatorHue = (baseHue + 180 + colorShift + i * 60) % 360;
+                    fill(indicatorHue, 100, 100, 0.6);
+                    noStroke();
+                    sphere(12 + bass * 18);
+                    
+                    // Pulsing rings - smoother animation
+                    for (let j = 0; j < 3; j++) {
+                        let ringSize = 25 + j * 12 + overallVolume * 35;
+                        let pulse = sin(frameCount * 0.05 + j) * 5;
+                        noFill();
+                        stroke(indicatorHue, 80, 80, 0.5 - j * 0.15);
+                        strokeWeight(2);
+                        ellipse(0, 0, ringSize + pulse, ringSize + pulse);
+                    }
+                    
+                    // Visual indicator for hand number - multiple rings for multiple hands
+                    push();
+                    translate(0, -25, 0);
+                    noFill();
+                    stroke(indicatorHue, 100, 100, 0.8);
+                    strokeWeight(2);
+                    // Draw multiple rings to indicate hand number
+                    for (let k = 0; k <= i; k++) {
+                        ellipse(0, 0, 15 + k * 8, 15 + k * 8);
+                    }
+                    pop();
+                    
+                    // Show gesture indicator above hand
+                    if (hand.currentGesture && hand.currentGesture !== 'unknown') {
+                        push();
+                        translate(0, -40, 0);
+                        let gestureHue = indicatorHue;
+                        
+                        // Draw shape preview based on gesture
+                        push();
+                        scale(0.3);
+                        fill(gestureHue, 100, 100, 0.9);
+                        stroke(gestureHue, 100, 50);
+                        strokeWeight(1);
+                        
+                        if (hand.currentGesture === 'heart') {
+                            drawHeart(20);
+                        } else if (hand.currentGesture === 'star') {
+                            drawStar(20);
+                        } else if (hand.currentGesture === 'diamond') {
+                            drawDiamond(20);
+                        } else if (hand.currentGesture === 'crescent') {
+                            drawCrescent(20);
+                        }
+                        pop();
+                        
+                        // Draw label ring
+                        push();
+                        translate(0, -15, 0);
+                        noFill();
+                        stroke(gestureHue, 80, 80, 0.6);
+                        strokeWeight(1);
+                        ellipse(0, 0, 25, 25);
+                        pop();
+                        
+                        pop();
+                    }
+                    
+                    pop();
+                }
+            }
+            
+            // Show hand count indicator in top-left of 3D space
+            if (trackedHands.length > 0) {
+                push();
+                translate(-width/2 + 50, -height/2 + 50, 0);
+                let countHue = (baseHue + 120) % 360;
+                fill(countHue, 100, 100, 0.7);
+                noStroke();
+                // Draw spheres to represent hand count
+                for (let i = 0; i < trackedHands.length && i < 2; i++) {
+                    push();
+                    translate(i * 30, 0, 0);
+                    sphere(8);
+                    pop();
+                }
+                pop();
+            }
+        }
+
+        function mousePressed() {
+            isMousePressed = true;
+            lastMouseX = mouseX;
+            lastMouseY = mouseY;
+            
+            // Add new 3D reactive object on click
+            let types = ['sphere', 'box', 'torus', 'cone'];
+            let screenX = mouseX - width/2;
+            let screenY = mouseY - height/2;
+            
+            // Convert screen coordinates to 3D space
+            let z = -cameraDistance;
+            reactiveObjects.push({
+                x: screenX * 0.5,
+                y: screenY * 0.5,
+                z: z + random(-100, 100),
+                type: random(types),
+                baseSize: random(15, 40),
+                hueOffset: random(0, 360),
+                rotation: { x: 0, y: 0, z: 0 },
+                life: 400
+            });
+        }
+
+        function mouseReleased() {
+            isMousePressed = false;
+        }
+
+        function windowResized() {
+            resizeCanvas(windowWidth, windowHeight);
+        }
+    </script>
+</body>
+</html>
